@@ -2,9 +2,13 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const sql = require('mssql');
+const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
+
+// Enable CORS for all routes
+app.use(cors());
 
 // Middleware to parse JSON requests
 app.use(bodyParser.json());
