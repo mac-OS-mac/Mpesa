@@ -3,7 +3,8 @@ const axios = require('axios');
 const bodyParser = require('body-parser');
 const sql = require('mssql');
 const cors = require('cors');
-require('dotenv').config();
+const { body, validationResult } = require('express-validator');
+require('dotenv-safe').config();
 
 const app = express();
 
@@ -15,9 +16,9 @@ app.use(bodyParser.json());
 
 // Azure SQL Database configuration
 const config = {
-    server: 'mpesadb-server.database.windows.net',
-    database: 'mpesa_payments',
-    user: 'mpesadb-server',
+    server: process.env.DB_SERVER,
+    database: process.env.DB_NAME,
+    user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     options: {
         encrypt: true,
@@ -26,46 +27,65 @@ const config = {
     }
 };
 
-// Test the database connection
-async function testConnection() {
+// Initialize database connection pool
+let pool;
+
+async function initializeDb() {
     try {
-        await sql.connect(config);
+        pool = await sql.connect(config);
         console.log('Connected to Azure SQL Database');
-        const result = await sql.query`SELECT 1 + 1 AS solution`;
-        console.log('Test query result:', result.recordset[0].solution);
     } catch (err) {
         console.error('Error connecting to the database:', err);
+        process.exit(1); // Exit if database connection fails
     }
 }
 
-testConnection();
+initializeDb();
+
+// Validate required environment variables
+const requiredEnvVars = ['DB_SERVER', 'DB_NAME', 'DB_USER', 'DB_PASSWORD', 'CONSUMER_KEY', 'CONSUMER_SECRET', 'SHORT_CODE', 'PASSKEY', 'CALLBACK_URL'];
+requiredEnvVars.forEach(envVar => {
+    if (!process.env[envVar]) {
+        console.error(`Missing required environment variable: ${envVar}`);
+        process.exit(1);
+    }
+});
 
 // Middleware to log API requests and responses
-app.use(async (req, res, next) => {
-    const logEntry = {
-        endpoint: req.originalUrl,
-        request_payload: JSON.stringify(req.body),
-        response_payload: JSON.stringify(res.body),
-        status_code: res.statusCode
+app.use((req, res, next) => {
+    const originalSend = res.send;
+    res.send = function (body) {
+        res.locals.response_payload = body;
+        originalSend.call(this, body);
     };
+    next();
+});
 
-    try {
-        await sql.connect(config);
-        const request = new sql.Request();
-        const query = `
-            INSERT INTO api_logs (endpoint, request_payload, response_payload, status_code)
-            VALUES (@endpoint, @request_payload, @response_payload, @status_code)
-        `;
-        request.input('endpoint', sql.VarChar, logEntry.endpoint);
-        request.input('request_payload', sql.Text, logEntry.request_payload);
-        request.input('response_payload', sql.Text, logEntry.response_payload);
-        request.input('status_code', sql.Int, logEntry.status_code);
-        await request.query(query);
-    } catch (err) {
-        console.error('Error logging API request:', err.message);
-    } finally {
-        next(); // Pass control to the next middleware or route handler
+app.use(async (req, res, next) => {
+    if (!req.originalUrl.startsWith('/health')) {
+        const logEntry = {
+            endpoint: req.originalUrl,
+            request_payload: JSON.stringify(req.body),
+            response_payload: JSON.stringify(res.locals.response_payload),
+            status_code: res.statusCode
+        };
+
+        try {
+            const request = pool.request();
+            const query = `
+                INSERT INTO api_logs (endpoint, request_payload, response_payload, status_code)
+                VALUES (@endpoint, @request_payload, @response_payload, @status_code)
+            `;
+            request.input('endpoint', sql.VarChar, logEntry.endpoint);
+            request.input('request_payload', sql.Text, logEntry.request_payload);
+            request.input('response_payload', sql.Text, logEntry.response_payload);
+            request.input('status_code', sql.Int, logEntry.status_code);
+            await request.query(query);
+        } catch (err) {
+            console.error('Error logging API request:', err.message);
+        }
     }
+    next();
 });
 
 // Constants for M-Pesa API credentials
@@ -96,7 +116,7 @@ async function generateMpesaToken() {
 // Function to initiate STK Push
 async function initiateSTKPush(phoneNumber, amount, orderId, token) {
     try {
-        const timestamp = new Date().toISOString().split('T')[0].replace(/-/g, '');
+        const timestamp = new Date().toISOString().replace(/[-:T]/g, '').split('.')[0];
         const password = Buffer.from(`${MPESA_CREDENTIALS.SHORT_CODE}${MPESA_CREDENTIALS.PASSKEY}${timestamp}`).toString('base64');
 
         const response = await axios.post(MPESA_CREDENTIALS.MPESA_STK_PUSH_URL, {
@@ -123,13 +143,18 @@ async function initiateSTKPush(phoneNumber, amount, orderId, token) {
 }
 
 // Endpoint to initiate M-Pesa payment
-app.post('/initiate-payment', async (req, res) => {
-    const { phone_number, amount, order_id, customer_email } = req.body;
-
-    // Validate request body
-    if (!phone_number || !amount || !order_id || !customer_email) {
-        return res.status(400).json({ error: 'Missing required fields' });
+app.post('/initiate-payment', [
+    body('phone_number').isMobilePhone(),
+    body('amount').isDecimal(),
+    body('order_id').isString().notEmpty(),
+    body('customer_email').isEmail()
+], async (req, res, next) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
     }
+
+    const { phone_number, amount, order_id, customer_email } = req.body;
 
     try {
         // Generate M-Pesa token
@@ -147,10 +172,10 @@ app.post('/initiate-payment', async (req, res) => {
             description: `Payment for Order ${order_id}`
         };
 
-        await sql.connect(config);
-        const request = new sql.Request();
+        const request = pool.request();
         const query = `
             INSERT INTO transactions (transaction_id, phone_number, amount, status, description)
+            OUTPUT INSERTED.id
             VALUES (@transaction_id, @phone_number, @amount, @status, @description)
         `;
         request.input('transaction_id', sql.VarChar, transaction.transaction_id);
@@ -159,21 +184,21 @@ app.post('/initiate-payment', async (req, res) => {
         request.input('status', sql.VarChar, transaction.status);
         request.input('description', sql.VarChar, transaction.description);
         const result = await request.query(query);
+        const transactionId = result.recordset[0].id;
 
         // Return success response
         res.status(200).json({
             message: 'Payment initiated successfully',
             data: stkPushResponse,
-            transactionId: result.recordset.insertId // Return the ID of the inserted record
+            transactionId
         });
     } catch (error) {
-        console.error('Error in /initiate-payment:', error.message);
-        res.status(500).json({ error: error.message || 'Failed to initiate payment' });
+        next(error);
     }
 });
 
 // Callback endpoint for M-Pesa
-app.post('/callback', async (req, res) => {
+app.post('/callback', async (req, res, next) => {
     const callbackData = req.body;
     console.log('Payment Callback:', callbackData);
 
@@ -184,8 +209,7 @@ app.post('/callback', async (req, res) => {
     const paymentStatus = ResultCode === '0' ? 'Success' : 'Failed';
 
     try {
-        await sql.connect(config);
-        const request = new sql.Request();
+        const request = pool.request();
         const query = `
             UPDATE transactions
             SET status = @status, mpesa_receipt_number = @mpesa_receipt_number
@@ -199,9 +223,14 @@ app.post('/callback', async (req, res) => {
         console.log('Transaction status updated successfully');
         res.status(200).send('Callback received and transaction status updated');
     } catch (err) {
-        console.error('Error updating transaction status:', err.message);
-        res.status(500).send('Failed to update transaction status');
+        next(err);
     }
+});
+
+// Centralized error handling
+app.use((err, req, res, next) => {
+    console.error('Error:', err.message);
+    res.status(500).json({ error: 'Internal Server Error' });
 });
 
 // Start the server
