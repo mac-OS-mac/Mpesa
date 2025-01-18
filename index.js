@@ -4,7 +4,7 @@ const bodyParser = require('body-parser');
 const sql = require('mssql');
 const cors = require('cors');
 const { body, validationResult } = require('express-validator');
-require('dotenv-safe').config();
+require('dotenv').config();
 
 const app = express();
 
@@ -157,55 +157,53 @@ app.post('/initiate-payment', [
     const { phone_number, amount, order_id, customer_email } = req.body;
 
     try {
-        // Generate M-Pesa token
         const token = await generateMpesaToken();
-
-        // Initiate STK Push
         const stkPushResponse = await initiateSTKPush(phone_number, amount, order_id, token);
-
-        // Save transaction to the database
-        const transaction = {
-            transaction_id: stkPushResponse.CheckoutRequestID, // Use CheckoutRequestID as transaction_id
-            phone_number,
-            amount,
-            status: 'Pending',
-            description: `Payment for Order ${order_id}`
-        };
 
         const request = pool.request();
         const query = `
             INSERT INTO transactions (transaction_id, phone_number, amount, status, description)
             OUTPUT INSERTED.id
-            VALUES (@transaction_id, @phone_number, @amount, @status, @description)
+            VALUES (@transaction_id, @phone_number, @amount, 'Pending', @description)
         `;
-        request.input('transaction_id', sql.VarChar, transaction.transaction_id);
-        request.input('phone_number', sql.VarChar, transaction.phone_number);
-        request.input('amount', sql.Decimal, transaction.amount);
-        request.input('status', sql.VarChar, transaction.status);
-        request.input('description', sql.VarChar, transaction.description);
+        request.input('transaction_id', sql.VarChar, stkPushResponse.CheckoutRequestID);
+        request.input('phone_number', sql.VarChar, phone_number);
+        request.input('amount', sql.Decimal, amount);
+        request.input('description', sql.VarChar, `Payment for Order ${order_id}`);
         const result = await request.query(query);
         const transactionId = result.recordset[0].id;
 
-        // Return success response
         res.status(200).json({
             message: 'Payment initiated successfully',
             data: stkPushResponse,
             transactionId
         });
     } catch (error) {
-        next(error);
+        console.error('Error initiating payment:', error);
+        if (error.message.includes('Failed to generate M-Pesa token')) {
+            res.status(503).json({ error: 'Service temporarily unavailable. Please try again later.' });
+        } else if (error.message.includes('Failed to initiate STK Push')) {
+            res.status(502).json({ error: 'Payment initiation failed. Please try again later.' });
+        } else {
+            next(error); // Let centralized error handling deal with unexpected errors
+        }
     }
 });
+
+        
+       
 
 // Callback endpoint for M-Pesa
 app.post('/callback', async (req, res, next) => {
     const callbackData = req.body;
     console.log('Payment Callback:', callbackData);
 
-    // Extract relevant data from the callback
-    const { ResultCode, CheckoutRequestID, MpesaReceiptNumber } = callbackData;
+    const { ResultCode, CheckoutRequestID, MpesaReceiptNumber } = callbackData || {};
 
-    // Determine payment status based on ResultCode
+    if (!ResultCode || !CheckoutRequestID) {
+        return res.status(400).send('Missing required callback data');
+    }
+
     const paymentStatus = ResultCode === '0' ? 'Success' : 'Failed';
 
     try {
@@ -216,16 +214,24 @@ app.post('/callback', async (req, res, next) => {
             WHERE transaction_id = @transaction_id
         `;
         request.input('status', sql.VarChar, paymentStatus);
-        request.input('mpesa_receipt_number', sql.VarChar, MpesaReceiptNumber);
+        request.input('mpesa_receipt_number', sql.VarChar, MpesaReceiptNumber || null);
         request.input('transaction_id', sql.VarChar, CheckoutRequestID);
-        await request.query(query);
+        const result = await request.query(query);
+
+        if (result.rowsAffected[0] === 0) {
+            console.warn('No transaction found for callback:', CheckoutRequestID);
+            return res.status(404).send('Transaction not found');
+        }
 
         console.log('Transaction status updated successfully');
         res.status(200).send('Callback received and transaction status updated');
     } catch (err) {
+        console.error('Error updating transaction status:', err);
         next(err);
     }
 });
+
+
 
 // Centralized error handling
 app.use((err, req, res, next) => {
