@@ -3,12 +3,18 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"No tests specified\" && exit 0",
+    "start": "node index.js"  
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "mpesa",
+    "payment",
+    "api",
+    "safaricom"
+  ],
+  "author": "mark ngige markngige@kejayacapo.com",
   "license": "ISC",
-  "description": "",
+  "description": "API for handling M-Pesa transactions",
   "dependencies": {
     "axios": "^1.7.9",
     "body-parser": "^1.20.3",
@@ -17,7 +23,9 @@
     "dotenv-safe": "^9.1.0",
     "express": "^4.21.2",
     "express-validator": "^7.2.1",
-    "mssql": "^11.0.1",
-    "mysql": "^2.18.1"
+    "mssql": "^11.0.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   }
 }
